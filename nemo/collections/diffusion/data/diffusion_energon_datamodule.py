@@ -109,6 +109,10 @@ class DiffusionDataModule(EnergonMultiModalDataModule):
             raise ValueError("Invalid value for split. Allowed values are 'train' or 'val'.")
         if self.use_train_split_for_val:
             split = 'train'
+        if split == "val":
+            virtual_epoch_length = 0
+        else:
+            virtual_epoch_length = self.virtual_epoch_length
         _dataset = get_train_dataset(
             self.path,
             batch_size=self.micro_batch_size,
@@ -117,7 +121,7 @@ class DiffusionDataModule(EnergonMultiModalDataModule):
             max_samples_per_sequence=self.max_samples_per_sequence,
             shuffle_buffer_size=None,
             split_part=split,
-            virtual_epoch_length=self.virtual_epoch_length,
+            virtual_epoch_length=virtual_epoch_length,
             packing_buffer_size=self.packing_buffer_size,
         )
         return _dataset

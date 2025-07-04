@@ -463,6 +463,8 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
             logging.info("Vae not provided, assuming the image input is precached...")
             self.vae = None
             self.vae_scale_factor = 16
+            self.vae_scale = 0.3611
+            self.vae_shift = 0.1159
 
     def configure_text_encoders(self, clip, t5):
         # pylint: disable=C0116
@@ -516,7 +518,11 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
             self.autocast_dtype = torch.float32
 
         if self.image_precached:
-            latents = batch['latents'].cuda(non_blocking=True)
+            mean, logvar = batch['mean'].cuda(non_blocking=True), batch['logvar'].cuda(non_blocking=True)
+            std = torch.exp(0.5 * logvar)
+            noise = torch.randn_like(mean, device=mean.device, dtype=mean.dtype) * std
+            latents = mean + noise
+            latents = self.vae_scale * (latents - self.vae_shift)
         else:
             img = batch['images'].cuda(non_blocking=True)
             latents = self.vae.encode(img).to(dtype=self.autocast_dtype)
@@ -526,7 +532,7 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         if self.text_precached:
             prompt_embeds = batch['prompt_embeds'].cuda(non_blocking=True).transpose(0, 1)
             pooled_prompt_embeds = batch['pooled_prompt_embeds'].cuda(non_blocking=True)
-            text_ids = batch['text_ids'].cuda(non_blocking=True)
+            text_ids = torch.zeros(prompt_embeds.shape[1], prompt_embeds.shape[0], 3).to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
         else:
             txt = batch['txt']
             prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(

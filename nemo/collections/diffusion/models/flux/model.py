@@ -16,7 +16,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import lightning.pytorch as L
 import numpy as np
@@ -51,7 +51,7 @@ from nemo.collections.diffusion.utils.flux_ckpt_converter import (
 from nemo.collections.diffusion.vae.autoencoder import AutoEncoder, AutoEncoderConfig
 from nemo.collections.llm import fn
 from nemo.lightning import io, teardown
-from nemo.lightning.megatron_parallel import MaskedTokenLossReduction
+from nemo.lightning.megatron_parallel import MaskedTokenLossReduction, MegatronLossReduction
 from nemo.lightning.pytorch.optim import MegatronOptimizerModule, OptimizerModule
 from nemo.utils import logging
 
@@ -395,6 +395,37 @@ class Flux(VisionModule):
                 )
         return sharded_state_dict
 
+class FluxValLossReduction(MegatronLossReduction):
+    
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(
+        self, batch: Dict[str, torch.Tensor], forward_out: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+
+        loss_per_timestep, timestep_counts = forward_out
+
+        loss_and_counts = torch.cat([loss_per_timestep.clone().detach(), timestep_counts.clone().detach()])
+        return loss_per_timestep, timestep_counts, {"loss_and_counts": loss_and_counts}
+
+    def reduce(self, losses_reduced_per_micro_batch) -> torch.Tensor:
+        if losses_reduced_per_micro_batch:
+
+            from megatron.core import parallel_state
+
+            loss_and_counts = [
+                x["loss_and_counts"] for x in losses_reduced_per_micro_batch if x["loss_and_counts"][1] > 0
+            ]
+            loss = torch.vstack(loss_and_counts).sum(dim=0)
+            torch.distributed.all_reduce(
+                loss,
+                group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
+            # average over the total number of tokens across the global batch.
+            return loss.chunk(2, dim=0)
+
+        return torch.tensor(0.0, device=torch.cuda.current_device())
 
 class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
     '''
@@ -424,6 +455,8 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         self.model_type = ModelType.encoder_or_decoder
         self.text_precached = self.t5_params is None or self.clip_params is None
         self.image_precached = self.vae_config is None
+        self.validation_loss_sum = torch.zeros(8, device=self.device, requires_grad=False)
+        self.validation_timestep_counts = torch.zeros(8, device=self.device, requires_grad=False)
 
     def configure_model(self):
         # pylint: disable=C0116
@@ -504,11 +537,57 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
 
     def validation_step(self, batch, batch_idx=None) -> torch.Tensor:
         # In mcore the loss-function is part of the forward-pass (when labels are provided)
+        def generate_val_timesteps(cur_val_timestep, samples):
+            """
+            Generate timesteps for validation set
 
-        return self.forward_step(batch)
+            This is a helper function to generate timesteps 0 through 7, repeating as necessary.
+            """
+            first_offset = torch.arange(cur_val_timestep, 8, device=self.device)[
+                :samples
+            ]
+            samples_left = samples - first_offset.numel()
+            val_timesteps = torch.arange(
+                0, 8, dtype=torch.int8, device=self.device
+            ).repeat_interleave(math.ceil(samples_left / 8))[:samples_left]
+            val_timesteps = torch.cat([first_offset, val_timesteps])
+            cur_val_timestep = (val_timesteps[-1].item() + 1) % 8
+            return val_timesteps, cur_val_timestep
+        timesteps = generate_val_timesteps(self.timestep, len(batch['images']))
+        loss = self.forward_step(batch, timesteps=timesteps)
+        self.timestep = self.timestep + len(batch['images'])
+        # Initialize a tensor to accumulate losses for each timestep (0-7)
+        loss_per_timestep = torch.zeros(8, device=loss.device)
+        # Reshape loss to have one value per sample
+        loss_per_sample = loss.mean(dim=(1, 2, 3))
+
+        # Get integer timestep values from the timestep_values
+        timestep_indices = timesteps.long()
+
+        # Use scatter_add_ for vectorized accumulation of losses by timestep
+        loss_per_timestep.scatter_add_(0, timestep_indices, loss_per_sample)
+
+        # Count samples per timestep for averaging (using bincount)
+        timestep_counts = torch.bincount(timestep_indices, minlength=8)
+
+        # Avoid division by zero
+        timestep_counts = torch.maximum(
+            timestep_counts, torch.ones_like(timestep_counts)
+        )
+        self.validation_loss_sum += loss_per_timestep
+        self.validation_timestep_counts += timestep_counts
+        return None
+
+    def on_validation_epoch_end(self) -> None:
+        timestep_counts_proportions = self.validation_timestep_counts / self.validation_timestep_counts.sum()
+        avg_loss_per_timestep = self.validation_loss_sum / self.validation_timestep_counts
+        avg_loss = (avg_loss_per_timestep * timestep_counts_proportions).sum()
+        self.log("val_loss", avg_loss)
+        self.validation_loss_sum = torch.zeros(8, device=self.device, requires_grad=False)
+        self.validation_timestep_counts = torch.zeros(8, device=self.device, requires_grad=False)
 
     # pylint: disable=C0116
-    def forward_step(self, batch) -> torch.Tensor:
+    def forward_step(self, batch, timesteps=None, reduction="mean") -> torch.Tensor:
         # pylint: disable=C0116
         if self.optim.config.bf16:
             self.autocast_dtype = torch.bfloat16
@@ -526,18 +605,21 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         else:
             img = batch['images'].cuda(non_blocking=True)
             latents = self.vae.encode(img).to(dtype=self.autocast_dtype)
-        latents, noise, packed_noisy_model_input, latent_image_ids, guidance_vec, timesteps = (
+        latents, noise, packed_noisy_model_input, latent_image_ids, guidance_vec, generated_timesteps = (
             self.prepare_image_latent(latents)
         )
+        if timesteps is None:
+            timesteps = generated_timesteps
         if self.text_precached:
             prompt_embeds = batch['prompt_embeds'].cuda(non_blocking=True).transpose(0, 1)
             pooled_prompt_embeds = batch['pooled_prompt_embeds'].cuda(non_blocking=True)
-            text_ids = torch.zeros(prompt_embeds.shape[1], prompt_embeds.shape[0], 3).to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+            text_ids = batch['text_ids'].cuda(non_blocking=True)
         else:
             txt = batch['txt']
             prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(
                 txt, device=latents.device, dtype=latents.dtype
             )
+
         with torch.cuda.amp.autocast(
             self.autocast_dtype in (torch.half, torch.bfloat16),
             dtype=self.autocast_dtype,
@@ -560,7 +642,7 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         ).transpose(0, 1)
 
         target = noise - latents
-        loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+        loss = F.mse_loss(noise_pred.float(), target.float(), reduction=reduction)
         return loss
 
     def encode_prompt(self, prompt, device='cuda', dtype=torch.float32):

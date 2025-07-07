@@ -253,6 +253,8 @@ class _MockT2IDataset(Dataset):
         item = {}
         if self.image_precached:
             item['latents'] = torch.randn(self.latent_shape)
+            item['mean'] = torch.randn(self.latent_shape)
+            item['logvar'] = torch.randn(self.latent_shape)
             item['control_latents'] = torch.randn(self.latent_shape)
         else:
             item[self.image_key] = torch.randn(3, self.H, self.W)

@@ -100,6 +100,7 @@ class FluxConfig(TransformerConfig, io.IOMixin):
     use_te_rng_tracker: bool = False
     cuda_graph_warmup_steps: int = 2
 
+    classifier_free_guidance_prob: float = 0.1
     guidance_scale: float = 3.5
     data_step_fn: Callable = flux_data_step
     ckpt_path: Optional[str] = None
@@ -146,6 +147,7 @@ class FluxModelParams:
     )
     clip_params: ClipConfig = field(default_factory=ClipConfig)
     t5_params: T5Config = field(default_factory=T5Config)
+    empty_encodings_path: Optional[str] = None
 
     scheduler_steps: int = 1000
     device: str = 'cuda'
@@ -465,6 +467,8 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         self.model_type = ModelType.encoder_or_decoder
         self.text_precached = self.t5_params is None or self.clip_params is None
         self.image_precached = self.vae_config is None
+        self.classifier_free_guidance_prob = self.params.classifier_free_guidance_prob
+        self.empty_encodings_path = self.params.empty_encodings_path
 
     def configure_model(self):
         # pylint: disable=C0116
@@ -473,6 +477,12 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         self.configure_vae(self.vae_config)
         self.configure_scheduler()
         self.configure_text_encoders(self.clip_params, self.t5_params)
+        if self.empty_encodings_path is not None:
+            empty_pooled_embeds = np.load(f"{self.empty_encodings_path}/empty_pooled_embeds.npy")
+            empty_embeds = np.load(f"{self.empty_encodings_path}/empty_embeds.npy")
+            self.register_buffer("empty_pooled_embeds", torch.from_numpy(empty_pooled_embeds))
+            self.register_buffer("empty_embeds", torch.from_numpy(empty_embeds))
+        
         for name, param in self.module.named_parameters():
             if self.config.num_single_layers == 0:
                 if 'context' in name or 'added' in name:
@@ -519,7 +529,6 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         else:
             logging.info("CLIP encoder not provided, assuming the text embeddings is precached...")
             self.clip = None
-
         if isinstance(t5, nn.Module):
             self.t5 = t5
         elif isinstance(t5, T5Config):
@@ -576,6 +585,29 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
             prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(
                 txt, device=latents.device, dtype=latents.dtype
             )
+        
+        dropout_mask = (
+            torch.rand(pooled_prompt_embeds.shape[0])
+            < self.classifier_free_guidance_prob
+        )
+        if dropout_mask.any():
+            if self.empty_embeds is None or self.empty_pooled_embeds is None:
+                if self.text_precached:
+                    raise Exception("When using precached text, empty embeddings must be provided")
+                
+                empty_embeds, empty_pooled_embeds, _ = self.encode_prompt(
+                    "", device=latents.device, dtype=latents.dtype
+                )
+                self.register_buffer("empty_embeds", empty_embeds)
+                self.register_buffer("empty_pooled_embeds", empty_pooled_embeds)
+
+            prompt_embeds[:, dropout_mask, :] = self.empty_embeds.cuda(
+                non_blocking=True
+            ).to(dtype=prompt_embeds.dtype)
+            pooled_prompt_embeds[dropout_mask] = self.empty_pooled_embeds.cuda(
+                non_blocking=True
+            ).to(dtype=pooled_prompt_embeds.dtype)
+        
         with torch.cuda.amp.autocast(
             self.autocast_dtype in (torch.half, torch.bfloat16),
             dtype=self.autocast_dtype,
